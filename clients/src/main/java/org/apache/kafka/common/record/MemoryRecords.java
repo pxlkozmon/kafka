@@ -3,9 +3,9 @@
  * file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file
  * to You under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
  * License. You may obtain a copy of the License at
- * 
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
  * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
  * specific language governing permissions and limitations under the License.
@@ -21,6 +21,7 @@ import java.util.Iterator;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.utils.AbstractIterator;
+import org.apache.kafka.common.utils.Utils;
 
 /**
  * A {@link Records} implementation backed by a ByteBuffer.
@@ -119,8 +120,8 @@ public class MemoryRecords implements Records {
             return false;
 
         return this.compressor.numRecordsWritten() == 0 ?
-            this.initialCapacity >= Records.LOG_OVERHEAD + Record.recordSize(key, value) :
-            this.writeLimit >= this.compressor.estimatedBytesWritten() + Records.LOG_OVERHEAD + Record.recordSize(key, value);
+                this.initialCapacity >= Records.LOG_OVERHEAD + Record.recordSize(key, value) :
+                this.writeLimit >= this.compressor.estimatedBytesWritten() + Records.LOG_OVERHEAD + Record.recordSize(key, value);
     }
 
     public boolean isFull() {
@@ -193,7 +194,7 @@ public class MemoryRecords implements Records {
             return new RecordsIterator(this.buffer.duplicate(), false);
         }
     }
-    
+
     @Override
     public String toString() {
         Iterator<LogEntry> iter = iterator();
@@ -245,35 +246,43 @@ public class MemoryRecords implements Records {
             this.shallow = true;
             this.stream = Compressor.wrapForInput(new ByteBufferInputStream(this.buffer), type, entry.record().magic());
             long wrapperRecordOffset = entry.offset();
+
+            long wrapperRecordTimestamp = entry.record().timestamp();
+            this.logEntries = new ArrayDeque<>();
             // If relative offset is used, we need to decompress the entire message first to compute
-            // the absolute offset.
-            if (entry.record().magic() > Record.MAGIC_VALUE_V0) {
-                this.logEntries = new ArrayDeque<>();
-                long wrapperRecordTimestamp = entry.record().timestamp();
+            // the absolute offset. For simplicity and because it's a format that is on its way out, we
+            // do the same for message format version 0
+            try {
                 while (true) {
                     try {
                         LogEntry logEntry = getNextEntryFromStream();
-                        Record recordWithTimestamp = new Record(logEntry.record().buffer(),
-                                                                wrapperRecordTimestamp,
-                                                                entry.record().timestampType());
-                        logEntries.add(new LogEntry(logEntry.offset(), recordWithTimestamp));
+                        if (entry.record().magic() > Record.MAGIC_VALUE_V0) {
+                            Record recordWithTimestamp = new Record(
+                                    logEntry.record().buffer(),
+                                    wrapperRecordTimestamp,
+                                    entry.record().timestampType()
+                            );
+                            logEntry = new LogEntry(logEntry.offset(), recordWithTimestamp);
+                        }
+                        logEntries.add(logEntry);
                     } catch (EOFException e) {
                         break;
-                    } catch (IOException e) {
-                        throw new KafkaException(e);
                     }
                 }
-                this.absoluteBaseOffset = wrapperRecordOffset - logEntries.getLast().offset();
-            } else {
-                this.logEntries = null;
-                this.absoluteBaseOffset = -1;
+                if (entry.record().magic() > Record.MAGIC_VALUE_V0)
+                    this.absoluteBaseOffset = wrapperRecordOffset - logEntries.getLast().offset();
+                else
+                    this.absoluteBaseOffset = -1;
+            } catch (IOException e) {
+                throw new KafkaException(e);
+            } finally {
+                Utils.closeQuietly(stream, "records iterator stream");
             }
-
         }
 
         /*
          * Read the next record from the buffer.
-         * 
+         *
          * Note that in the compressed message set, each message value size is set as the size of the un-compressed
          * version of the message value, so when we do de-compression allocating an array of the specified size for
          * reading compressed value data is sufficient.
